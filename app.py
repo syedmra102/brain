@@ -28,7 +28,9 @@ def recommend_goal(interests, df):
     interest_vector = np.zeros(len(df.columns[1:]))
     for interest in interests:
         if interest in df.columns[1:]:
-            interest_vector[df.columns[1:].index(interest)] = 1
+            cols = list(df.columns[1:])   # convert to list
+            if interest in cols:          # safety check
+    interest_vector[cols.index(interest)] = 1
     similarities = cosine_similarity([interest_vector], df.iloc[:, 1:])[0]
     top_idx = np.argmax(similarities)
     return df['field'][top_idx]
