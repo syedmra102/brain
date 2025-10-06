@@ -1,1 +1,2 @@
 setuptools streamlit pandas numpy scikit-learn
+opencv-python-headless
