@@ -1,92 +1,106 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.linear_model import LinearRegression
 import sqlite3
-from datetime import datetime, timedelta
-import re
+from datetime import datetime
 
 # ---------------------------
-# Utility Functions
+# Database Setup
 # ---------------------------
-def recommend_goal(interests, df):
-    cols = list(df.columns[1:])  # skip the first column (e.g., field name)
-    interest_vector = np.zeros(len(cols))
-
-    for interest in interests:
-        if interest in cols:
-            interest_vector[cols.index(interest)] = 1
-
-    similarity = cosine_similarity([interest_vector], df.iloc[:, 1:])
-    recommended_index = np.argmax(similarity)
-    return df.iloc[recommended_index, 0]  # first column = field name
-
-def save_feedback(user, feedback, db="feedback.db"):
-    conn = sqlite3.connect(db)
+def init_db():
+    conn = sqlite3.connect("progress.db")
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS feedback
-                 (user TEXT, feedback TEXT, date TEXT)''')
-    c.execute("INSERT INTO feedback VALUES (?, ?, ?)",
-              (user, feedback, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    c.execute('''CREATE TABLE IF NOT EXISTS progress
+                 (name TEXT, goal TEXT, interests TEXT, distractions TEXT, 
+                 current_hours INT, available_hours INT, day_count INT, last_update TEXT)''')
     conn.commit()
     conn.close()
 
-def load_feedback(db="feedback.db"):
-    conn = sqlite3.connect(db)
+def save_progress(name, goal, interests, distractions, current_hours, available_hours):
+    conn = sqlite3.connect("progress.db")
     c = conn.cursor()
-    c.execute("SELECT * FROM feedback")
-    rows = c.fetchall()
+
+    # Check if user already exists
+    c.execute("SELECT * FROM progress WHERE name=?", (name,))
+    row = c.fetchone()
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if row:
+        # Update existing user progress (if last update is a new day)
+        last_update = row[7]
+        day_count = row[6]
+        if last_update != today:
+            day_count += 1
+        c.execute("""UPDATE progress SET goal=?, interests=?, distractions=?, 
+                     current_hours=?, available_hours=?, day_count=?, last_update=? 
+                     WHERE name=?""",
+                  (goal, interests, distractions, current_hours, available_hours, day_count, today, name))
+    else:
+        # Insert new user
+        c.execute("INSERT INTO progress VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                  (name, goal, interests, distractions, current_hours, available_hours, 1, today))
+
+    conn.commit()
     conn.close()
-    return rows
+
+def load_progress(name):
+    conn = sqlite3.connect("progress.db")
+    c = conn.cursor()
+    c.execute("SELECT * FROM progress WHERE name=?", (name,))
+    row = c.fetchone()
+    conn.close()
+    return row
 
 # ---------------------------
-# Main App
+# Grading System
+# ---------------------------
+def get_grade(day_count):
+    if day_count >= 60:
+        return "🥇 Gold"
+    elif day_count >= 30:
+        return "🥈 Platinum"
+    elif day_count >= 15:
+        return "🥉 Silver"
+    else:
+        return "⏳ Keep Going!"
+
+# ---------------------------
+# Streamlit App
 # ---------------------------
 def main():
-    st.title("🧠 Brain – Career & Goal Recommendation App")
-    st.write("This app helps you explore possible career paths based on your interests.")
+    st.title("🧠 Brain – Goal & Habit Tracker")
+    st.write("Track your goals, distractions, hours, and build habits with a grading system.")
 
-    # Upload dataset
-    uploaded_file = st.file_uploader("Upload your dataset (CSV)", type="csv")
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
+    init_db()
 
-        st.subheader("Available Fields in Dataset")
-        st.write(df.head())
+    name = st.text_input("Enter your name:")
+    goal = st.text_input("What is your goal? (e.g., Become a Data Scientist, Cricketer, etc.)")
+    interests = st.text_area("Enter your interests (comma separated):")
+    distractions = st.text_area("What distractions do you want to reduce?")
+    current_hours = st.number_input("How many hours do you currently spend daily on your goal?", min_value=0, max_value=24)
+    available_hours = st.number_input("How many free hours do you have daily?", min_value=0, max_value=24)
 
-        # User input
-        user_name = st.text_input("Enter your name:")
-        user_interests = st.text_area("Enter your interests (comma separated):")
-
-        if st.button("Submit"):
-            if user_name and user_interests:
-                interests = [i.strip() for i in user_interests.split(",")]
-
-                try:
-                    recommended_field = recommend_goal(interests, df)
-                    st.success(f"🎯 Recommended Field: **{recommended_field}**")
-                except Exception as e:
-                    st.error(f"Error in recommendation: {e}")
-
-            else:
-                st.warning("⚠️ Please enter your name and interests.")
-
-    # Feedback section
-    st.subheader("💬 Feedback")
-    feedback_text = st.text_area("Leave your feedback here:")
-    if st.button("Submit Feedback"):
-        if feedback_text:
-            save_feedback("Anonymous", feedback_text)
-            st.success("✅ Feedback submitted successfully!")
+    if st.button("Save Progress"):
+        if name and goal:
+            save_progress(name, goal, interests, distractions, current_hours, available_hours)
+            st.success("✅ Progress saved successfully!")
         else:
-            st.warning("Please enter feedback before submitting.")
+            st.warning("⚠️ Please enter at least your name and goal.")
 
-    # Show feedback
-    if st.checkbox("Show all feedback"):
-        feedbacks = load_feedback()
-        for f in feedbacks:
-            st.write(f"📝 {f[0]} said: {f[1]} ({f[2]})")
+    if name:
+        progress = load_progress(name)
+        if progress:
+            st.subheader(f"📊 Progress for {progress[0]}")
+            st.write(f"**Goal:** {progress[1]}")
+            st.write(f"**Interests:** {progress[2]}")
+            st.write(f"**Distractions:** {progress[3]}")
+            st.write(f"**Current Hours/Day:** {progress[4]}")
+            st.write(f"**Available Hours/Day:** {progress[5]}")
+            st.write(f"**Days Tracked:** {progress[6]}")
+            st.write(f"**Last Update:** {progress[7]}")
+
+            grade = get_grade(progress[6])
+            st.success(f"🏆 Current Level: {grade}")
 
 # ---------------------------
 if __name__ == "__main__":
