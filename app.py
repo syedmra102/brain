@@ -1,213 +1,407 @@
+# app.py
+# The Brain — top-notch habit/goal/roadmap app (Streamlit)
+# Designed for Streamlit Cloud. Uses SQLite for persistence, no external CSV required.
+
 import streamlit as st
 import pandas as pd
 import numpy as np
+import sqlite3
+from datetime import datetime, timedelta, date
+import re
+import random
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.linear_model import LinearRegression
-import sqlite3
-from datetime import datetime, timedelta
-import re
-from textblob import TextBlob  # For NLP sentiment analysis on distractions
-import random  # For motivational quotes
 
-# Database setup (enhanced for badges and roadmaps)
+# -----------------------
+# CONFIG & CONSTANTS
+# -----------------------
+DB_PATH = "brain_user_data.db"
+
+MOTIVATIONAL_QUOTES = [
+    "The journey of a thousand miles begins with one step. — Lao Tzu",
+    "Success is the sum of small efforts repeated day in and day out. — Robert Collier",
+    "You are never too old to set another goal or to dream a new dream. — C.S. Lewis",
+    "Small daily improvements are the key to staggering long-term results.",
+    "Focus on progress, not perfection."
+]
+
+# Stages mapping: stage -> required hours/day
+HOUR_STAGES = {1: 2, 2: 4, 3: 6}
+
+# Badge thresholds (days)
+DISTRACTION_THRESHOLDS = {"silver": 15, "platinum": 30, "gold": 60}
+MASTERY_THRESHOLDS = {"silver": (3, 15), "platinum": (6, 30), "gold": (8, 60)}
+# mastery tuple: (hours_per_day_required, streak_days_required)
+
+# keywords for distraction detection
+DISTRACTION_KEYWORDS = [
+    "social media", "facebook", "instagram", "tiktok", "youtube", "gaming",
+    "scrolling", "procrastinate", "procrastination", "netflix", "tv", "twitter", "snapchat"
+]
+
+# -----------------------
+# UTIL: Database
+# -----------------------
 def init_db():
-    conn = sqlite3.connect('user_data.db')
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     c = conn.cursor()
-    
-    # Always create table if not exists
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (user_id TEXT PRIMARY KEY, field TEXT, hours_per_day REAL, distractions TEXT, 
-                  streak_days INTEGER, badges TEXT, last_updated TEXT, total_hours REAL)''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS roadmaps 
-                 (field TEXT PRIMARY KEY, starting_steps TEXT, month1_plan TEXT, uniqueness_tips TEXT)''')
-    
-    # Pre-populate roadmaps if empty
-    c.execute("SELECT COUNT(*) FROM roadmaps")
-    if c.fetchone()[0] == 0:
-        sample_roadmaps = [
-            ("Cricket", "Join a local club; focus on fitness.", "Practice batting/bowling 3x/week; watch tutorials.", "Develop agility for spin bowling if tall."),
-            ("Programming", "Learn Python basics on Codecademy.", "Build 1 CLI app; contribute to GitHub.", "Specialize in ML for healthcare apps."),
-            ("Music", "Practice scales daily; use free apps like Yousician.", "Compose 1 simple song; join online jam sessions.", "Blend genres like fusion for uniqueness."),
-            ("Data Science", "Take free Kaggle courses.", "Analyze a dataset; build a model.", "Focus on ethical AI for social impact."),
-            ("Business", "Read 'Rich Dad Poor Dad'; start a side hustle.", "Create a business plan; network on LinkedIn.", "Innovate in local markets like e-commerce in Pakistan.")
-        ]
-        for field, steps, month1, tips in sample_roadmaps:
-            c.execute("INSERT OR REPLACE INTO roadmaps (field, starting_steps, month1_plan, uniqueness_tips) VALUES (?, ?, ?, ?)",
-                      (field, steps, month1, tips))
-
+    # users table: basic profile and cumulative stats
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            display_name TEXT,
+            field TEXT,
+            hour_stage INTEGER DEFAULT 1,
+            total_hours REAL DEFAULT 0,
+            streak_days INTEGER DEFAULT 0,
+            badges TEXT DEFAULT '',
+            last_check DATE
+        )
+    ''')
+    # daily_entries: one row per user per date (distraction_free boolean, hours_logged)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS daily_entries (
+            user_id TEXT,
+            entry_date DATE,
+            distraction_free INTEGER,
+            hours_logged REAL,
+            PRIMARY KEY(user_id, entry_date)
+        )
+    ''')
+    # roadmaps (prepopulated)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS roadmaps (
+            field TEXT PRIMARY KEY,
+            starting_steps TEXT,
+            month1_plan TEXT,
+            uniqueness_tips TEXT
+        )
+    ''')
+    # ensure some sample roadmaps exist
+    sample_roadmaps = [
+        ("Cricket", "Join a local club; build fitness; get a coach.", "Daily batting and bowling drills, fitness 4x/week.", "Develop a unique skill: accurate slower balls."),
+        ("Programming", "Learn Python basics, practice coding 1 hour/day.", "Build CLI tool -> web app -> deploy to GitHub.", "Niche: ML for local problems (health / energy)."),
+        ("Data Science", "Learn pandas, visualize data, load datasets from Kaggle.", "Build an end-to-end model and dashboard this month.", "Focus on explainability and real datasets."),
+        ("Cybersecurity", "Learn networking basics, then OWASP web vulnerabilities.", "Practice CTF challenges, set up a home lab.", "Specialize in bug bounty or IoT security."),
+        ("Music", "Daily scales and ear training.", "Compose a short track and share for feedback.", "Mix traditional sounds with modern beats.")
+    ]
+    for f, s, m, t in sample_roadmaps:
+        c.execute("INSERT OR REPLACE INTO roadmaps (field, starting_steps, month1_plan, uniqueness_tips) VALUES (?, ?, ?, ?)",
+                  (f, s, m, t))
     conn.commit()
     return conn
 
+# -----------------------
+# UTIL: Data (recommendation dataset)
+# -----------------------
+def get_sample_skill_df():
+    # small built-in matrix where columns represent skills/interest areas
+    data = {
+        "field": ["Data Science", "Machine Learning", "Cybersecurity", "Cloud Computing", "Network Engineering",
+                  "Cricket", "Programming", "Music", "Business", "Graphic Design"],
+        "math":         [1, 1, 0, 1, 1, 0, 1, 0, 0, 0],
+        "coding":       [1, 1, 0, 1, 1, 0, 1, 0, 1, 1],
+        "research":     [1, 1, 0, 0, 0, 0, 1, 0, 1, 0],
+        "security":     [0, 0, 1, 0, 1, 0, 0, 0, 0, 0],
+        "biology":      [0, 0, 0, 0, 0, 1, 0, 1, 0, 0],
+        "creativity":   [0, 0, 0, 0, 0, 0, 0, 1, 1, 1]
+    }
+    return pd.DataFrame(data)
 
-# Load synthetic data for ML recommendations
-@st.cache_data
-def load_data():
-    df = pd.read_csv('data.csv')
-    return df
-
-# Enhanced goal recommendation (collaborative filtering)
+# -----------------------
+# BUSINESS LOGIC
+# -----------------------
 def recommend_goal(interests, df):
-    interest_vector = np.zeros(len(df.columns[1:]))
+    # interests: list of strings matching column names (e.g. 'coding', 'math')
+    cols = list(df.columns[1:])
+    interest_vector = np.zeros(len(cols))
     for interest in interests:
-        if interest in df.columns[1:]:
-            interest_vector[df.columns[1:].index(interest)] = 1
+        interest = interest.strip().lower()
+        if interest in cols:
+            idx = cols.index(interest)
+            interest_vector[idx] = 1
+    # if user selects no recognized interest, fallback to random field
+    if interest_vector.sum() == 0:
+        return random.choice(df['field'].tolist())
     similarities = cosine_similarity([interest_vector], df.iloc[:, 1:])[0]
-    top_idx = np.argmax(similarities)
-    return df['field'][top_idx]
+    top_idx = int(np.argmax(similarities))
+    return df['field'].iloc[top_idx]
 
-# Enhanced progress prediction (10,000-hour rule with simulation)
-def predict_progress(hours_per_day, field, total_hours=0):
-    # Simulate 10,000 hours for mastery
-    X = np.array([[1], [2], [3], [4], [5], [6], [8]]).reshape(-1, 1)  # Hours/day
-    y = np.array([10000/1, 10000/2, 10000/3, 10000/4, 10000/5, 10000/6, 10000/8])  # Days to mastery
+def predict_progress(hours_per_day, total_hours=0):
+    # Use a simple regression based on the 10,000-hour rule (days -> months)
+    X = np.array([[1], [2], [3], [4], [5], [6], [8]]).reshape(-1, 1)
+    y = np.array([10000/1, 10000/2, 10000/3, 10000/4, 10000/5, 10000/6, 10000/8])
     model = LinearRegression().fit(X, y)
-    days_remaining = model.predict(np.array([[hours_per_day]]))[0] - (total_hours / hours_per_day)
-    months = max(0, round(days_remaining / 30, 1))  # Months
-    years = round(months / 12, 1)
-    return months, years, total_hours + (hours_per_day * 30)  # Update total hours for 30 days
+    # days to mastery remaining (if hours_per_day > 0)
+    if hours_per_day <= 0:
+        return None, None, total_hours
+    days = model.predict(np.array([[hours_per_day]]))[0]
+    # subtract already invested hours converted to days at current rate
+    days_remaining = max(0, days - (total_hours / hours_per_day if hours_per_day > 0 else 0))
+    months = round(days_remaining / 30, 1)
+    years = round(months / 12, 2)
+    new_total_hours = total_hours + (hours_per_day * 30)  # add 30 days of hours to total
+    return months, years, new_total_hours
 
-# Enhanced distraction detection (NLP with sentiment analysis)
 def detect_distractions(text):
-    if text.lower() == 'none':
+    if not text:
         return False
-    blob = TextBlob(text)
-    sentiment = blob.sentiment.polarity  # Negative sentiment indicates distraction
-    keywords = ['social media', 'gaming', 'scrolling', 'tv', 'procrastinating']
-    has_keywords = any(re.search(keyword, text.lower()) for keyword in keywords)
-    return sentiment < 0 or has_keywords
+    # basic keyword + simple sentiment-like heuristic
+    txt = text.lower()
+    if txt.strip() in ("none", "no", "n/a"):
+        return False
+    # keyword check
+    for kw in DISTRACTION_KEYWORDS:
+        if kw in txt:
+            return True
+    # negative language heuristic (simple)
+    negative_words = ["addicted", "can't stop", "can't focus", "waste", "wasting", "procrastinate"]
+    for nw in negative_words:
+        if nw in txt:
+            return True
+    return False
 
-# Enhanced badge system (your idea: distraction-free and mastery paths)
-def update_badges(conn, user_id, hours_per_day, distractions, streak_days, total_hours):
-    badges = []
-    is_distracted = detect_distractions(distractions)
-    if not is_distracted:
-        if streak_days >= 15:
-            badges.append('Silver (Distraction-Free - 15 days strong!)')
-        if streak_days >= 45:
-            badges.append('Platinum (Distraction-Free - 45 days unstoppable!)')
-        if streak_days >= 105:
-            badges.append('Gold (Distraction-Free - 105 days mastered!)')
-    # Mastery badges (based on hours/day and streak)
-    if hours_per_day >= 3 and streak_days >= 15:
-        badges.append('Silver (Mastery - 3 hrs/day for 15 days)')
-    if hours_per_day >= 6 and streak_days >= 30:
-        badges.append('Platinum (Mastery - 6 hrs/day for 30 days)')
-    if hours_per_day >= 8 and streak_days >= 60:
-        badges.append('Gold (Mastery - 8 hrs/day for 60 days - Habit formed!)')
+def update_badges_and_stats(conn, user_id):
     c = conn.cursor()
-    c.execute("UPDATE users SET badges = ? WHERE user_id = ?", (','.join(badges), user_id))
+    c.execute("SELECT streak_days, total_hours, hour_stage FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        return []
+    streak_days, total_hours, hour_stage = row
+    badges = []
+    # Distraction-free badges based on streak_days
+    if streak_days >= DISTRACTION_THRESHOLDS["gold"]:
+        badges.append("Gold (Distraction-Free)")
+    elif streak_days >= DISTRACTION_THRESHOLDS["platinum"]:
+        badges.append("Platinum (Distraction-Free)")
+    elif streak_days >= DISTRACTION_THRESHOLDS["silver"]:
+        badges.append("Silver (Distraction-Free)")
+    # Mastery badges based on total_hours and stage
+    # We'll use simple thresholds in MASTERY_THRESHOLDS
+    for label, (req_hours, req_days) in MASTERY_THRESHOLDS.items():
+        if hour_stage >= 1 and total_hours >= (req_hours * req_days):
+            # e.g., if they've logged (req_hours * req_days) total hours
+            if label == "gold":
+                badges.append("Gold (Mastery)")
+            elif label == "platinum":
+                badges.append("Platinum (Mastery)")
+            else:
+                badges.append("Silver (Mastery)")
+    # store badges
+    c.execute("UPDATE users SET badges = ? WHERE user_id = ?", (",".join(badges), user_id))
     conn.commit()
     return badges
 
-# Get roadmap (rule-based, based on your idea)
-def get_roadmap(conn, field):
+# -----------------------
+# UI Helpers
+# -----------------------
+def get_user(conn, user_id):
     c = conn.cursor()
-    c.execute("SELECT starting_steps, month1_plan, uniqueness_tips FROM roadmaps WHERE field = ?", (field,))
-    result = c.fetchone()
-    if result:
-        return result
-    return "Roadmap not found. Start with basics and build daily habits!", "Focus on 1 month goals.", "Find your unique strength to stand out."
+    c.execute("SELECT user_id, display_name, field, hour_stage, total_hours, streak_days, badges, last_check FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    if row:
+        keys = ["user_id","display_name","field","hour_stage","total_hours","streak_days","badges","last_check"]
+        return dict(zip(keys, row))
+    return None
 
-# Motivational quotes (random for engagement)
-motivational_quotes = [
-    "The journey of a thousand miles begins with one step. - Lao Tzu",
-    "Success is the sum of small efforts repeated day in and day out. - Robert Collier",
-    "You are never too old to set another goal or to dream a new dream. - C.S. Lewis"
-]
+def create_or_update_user(conn, user_id, display_name, field):
+    c = conn.cursor()
+    now = date.today().isoformat()
+    user = get_user(conn, user_id)
+    if user:
+        c.execute("UPDATE users SET display_name = ?, field = ? WHERE user_id = ?", (display_name, field, user_id))
+    else:
+        c.execute("INSERT INTO users (user_id, display_name, field, hour_stage, total_hours, streak_days, badges, last_check) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                  (user_id, display_name, field, 1, 0.0, 0, "", now))
+    conn.commit()
 
-# Streamlit UI (top-notch: sidebar, charts, simulations)
+def log_daily_entry(conn, user_id, entry_date, distraction_free, hours_logged):
+    c = conn.cursor()
+    # insert or replace
+    c.execute("""
+        INSERT OR REPLACE INTO daily_entries (user_id, entry_date, distraction_free, hours_logged)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, entry_date, int(distraction_free), float(hours_logged)))
+    # update totals / streaks
+    # total hours
+    c.execute("SELECT SUM(hours_logged) FROM daily_entries WHERE user_id = ?", (user_id,))
+    total = c.fetchone()[0] or 0.0
+    # compute streak_days: number of consecutive days up to today where distraction_free == 1
+    streak = compute_streak(conn, user_id)
+    c.execute("UPDATE users SET total_hours = ?, streak_days = ?, last_check = ? WHERE user_id = ?",
+              (total, streak, entry_date, user_id))
+    conn.commit()
+    # after update, recalc badges
+    return update_badges_and_stats(conn, user_id)
+
+def compute_streak(conn, user_id):
+    c = conn.cursor()
+    # get last 200 days entries (safeguard)
+    today = date.today()
+    dates = [(today - timedelta(days=i)).isoformat() for i in range(0, 200)]
+    streak = 0
+    for d in dates:
+        c.execute("SELECT distraction_free FROM daily_entries WHERE user_id = ? AND entry_date = ?", (user_id, d))
+        r = c.fetchone()
+        if r and r[0] == 1:
+            streak += 1
+        else:
+            break
+    return streak
+
+# -----------------------
+# MAIN STREAMLIT APP
+# -----------------------
 def main():
-    st.set_page_config(page_title="The Brain App", page_icon="🧠", layout="wide")
-    st.title("🧠 The Brain That Helps You to Use Your Brain!!")
-    st.markdown("**Your personal ML coach for goals, habits, and mastery. Based on your idea to help students and aimless people!**")
+    st.set_page_config(page_title="🧠 The Brain — Habit & Goal Coach", layout="wide")
+    st.title("🧠 The Brain That Helps You Use Your Brain")
+    st.write("ML-powered habit coach, roadmap suggestions, and achievement badges. Built for learners and doers.")
 
-    # Sidebar for user profile
+    conn = init_db()
+    skill_df = get_sample_skill_df()
+
+    # Sidebar: user profile
     st.sidebar.header("Your Profile")
-    user_id = st.sidebar.text_input("User ID", value="syedmra102", key="user_id")
-    if 'user_session' not in st.session_state:
-        st.session_state.user_session = user_id
+    user_id = st.sidebar.text_input("Username (unique)", value="syedmra102")
+    display_name = st.sidebar.text_input("Display name", value="Imran")
+    chosen_field = st.sidebar.text_input("Chosen field (will save as preference)", value="Cricket")
+    if st.sidebar.button("Save profile"):
+        create_or_update_user(conn, user_id, display_name, chosen_field)
+        st.sidebar.success("Profile saved!")
 
-    # Main content
-    col1, col2 = st.columns(2)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Daily Motivation")
+    st.sidebar.write(random.choice(MOTIVATIONAL_QUOTES))
+    st.sidebar.markdown("---")
+    # Quick leaderboard
+    if st.sidebar.checkbox("Show leaderboard"):
+        c = conn.cursor()
+        c.execute("SELECT display_name, total_hours, streak_days, badges FROM users ORDER BY total_hours DESC LIMIT 10")
+        rows = c.fetchall()
+        if rows:
+            lb = pd.DataFrame(rows, columns=["Name","Total Hours","Streak Days","Badges"])
+            st.sidebar.table(lb)
+        else:
+            st.sidebar.info("No users yet — be the first!")
+
+    # Main columns
+    col1, col2 = st.columns([2, 1])
+
     with col1:
-        st.header("Set Your Goals")
-        interests = st.multiselect("Select Interests", ['Sports', 'Programming', 'Music', 'Art', 'Science', 'Business', 'Health'])
-        field = st.text_input("Chosen Field (e.g., Cricket)", value="Cricket", key="field")
-        hours_per_day = st.slider("Daily Hours", 0.0, 12.0, 3.0, key="hours")
-        distractions = st.text_area("Describe Distractions (e.g., 'social media scrolling')", value="None", key="distractions")
-        streak_days = st.number_input("Current Streak Days", 0, 365, 1, key="streak")
+        st.header("Set Goal & Log Today's Progress")
+        interests_input = st.text_input("List your interests (comma separated) — examples: coding, math, creativity")
+        interests = [i.strip().lower() for i in interests_input.split(",") if i.strip()] if interests_input else []
+        st.caption("Pick skills/areas like: math, coding, research, security, biology, creativity")
+
+        field = st.text_input("Your current target field (e.g., Cricket, Data Science)", value=chosen_field)
+        hours_today = st.number_input("Hours you worked today on this field", min_value=0.0, max_value=24.0, value=0.0, step=0.5)
+        distraction_text = st.text_input("Describe distractions you faced today (or type 'None')", value="None")
+
+        # Analyze & Save button
+        if st.button("Analyze & Save Today"):
+            # ensure profile exists
+            create_or_update_user(conn, user_id, display_name, field)
+            # Recommendation (if user provided interests)
+            if interests:
+                recommended = recommend_goal(interests, skill_df)
+                st.success(f"Recommended field based on interests: **{recommended}**")
+                if recommended != field:
+                    st.info(f"Suggestion: consider exploring **{recommended}** (based on your interests).")
+            # Predict progress
+            months, years, new_total = predict_progress(hours_today, total_hours=get_user(conn, user_id)["total_hours"] if get_user(conn, user_id) else 0)
+            if months is not None:
+                st.metric("Estimated time to mastery", f"{months} months (~{years} years)")
+            else:
+                st.info("Log some hours per day to get a time estimate.")
+
+            # Detect distraction
+            is_distracted = detect_distractions(distraction_text)
+            if is_distracted:
+                st.warning("Distraction detected — consider reducing it and logging distraction-free days.")
+            else:
+                st.success("Great — no major distraction detected today!")
+
+            # Enforce stage hours progression: user must satisfy current stage target
+            user = get_user(conn, user_id)
+            if user is None:
+                create_or_update_user(conn, user_id, display_name, field)
+                user = get_user(conn, user_id)
+            current_stage = user["hour_stage"]
+            required_hours = HOUR_STAGES.get(current_stage, 6)
+            if hours_today < required_hours:
+                st.info(f"Stage {current_stage} target is {required_hours} hrs/day. You logged {hours_today} — keep trying! (Aim to hit {required_hours} to progress.)")
+            else:
+                # If they reached required hours, they can progress stage next time (we'll increment stage only if they consistently meet, but for simplicity increment)
+                if current_stage < 3 and hours_today >= required_hours:
+                    # progress stage after meeting required hours for one day — you could require multiple days in production
+                    new_stage = current_stage + 1
+                    c = conn.cursor()
+                    c.execute("UPDATE users SET hour_stage = ? WHERE user_id = ?", (new_stage, user_id))
+                    conn.commit()
+                    st.success(f"Congrats! You have advanced to Stage {new_stage} (target {HOUR_STAGES[new_stage]} hrs/day).")
+
+            # Log today's entry
+            today_iso = date.today().isoformat()
+            distraction_free_flag = 0 if is_distracted else 1
+            badges = log_daily_entry(conn, user_id, today_iso, distraction_free_flag, hours_today)
+            if badges:
+                st.balloons()
+                st.success(f"New badges / current badges: {', '.join(badges)}")
+            else:
+                st.info("No new badges today — consistency is key.")
 
     with col2:
-        st.header("ML Insights")
-        if st.button("Analyze & Predict 🧠", key="submit"):
-            conn = init_db()
-            df = load_data()
+        st.header("Quick Insights & Roadmap")
+        # show user info
+        user = get_user(conn, user_id)
+        if user:
+            st.subheader(f"{user['display_name']} — {user['field']}")
+            st.write(f"Stage: {user['hour_stage']} (target {HOUR_STAGES.get(user['hour_stage'],6)} hrs/day)")
+            st.write(f"Total hours logged: {user['total_hours']:.1f}")
+            st.write(f"Streak days (distraction-free): {user['streak_days']}")
+            st.write(f"Badges: {user['badges'] or 'None yet'}")
+        else:
+            st.info("Save your profile to see live stats here.")
 
-            # ML: Recommend goal
-            if interests:
-                recommended_field = recommend_goal(interests, df)
-                st.success(f"**Recommended Field:** {recommended_field}")
-                if recommended_field != field:
-                    st.info(f"Consider switching to {recommended_field} for better fit!")
-
-            # ML: Predict progress
-            months, years, updated_total_hours = predict_progress(hours_per_day, field)
-            st.metric("Time to Mastery", f"{months} months / {years} years")
-            st.info(f"Based on 10,000-hour rule: At {hours_per_day} hrs/day, you'll master {field}!")
-
-            # Distraction detection
-            if detect_distractions(distractions):
-                st.warning("🚨 Distraction Detected! (High sentiment or keywords like 'gaming'). Reduce to build streaks.")
-            else:
-                st.success("✅ Focused! Keep it up to earn badges.")
-
-            # Update database
-            c = conn.cursor()
-            c.execute("SELECT hours_per_day, total_hours, last_updated FROM users WHERE user_id = ?", (user_id,))
-            data = c.fetchall()
-
-             if data:
-                     df_progress = pd.DataFrame(data, columns=['Daily Hours', 'Total Hours', 'Date'])
-                     st.line_chart(df_progress.set_index('Date')[['Daily Hours', 'Total Hours']])
-                     st.metric("Total Hours Invested", df_progress['Total Hours'].iloc[-1])
-              else:
-                    st.info("No progress yet! Log your first session to see charts.")
-
-
-            
-            # Roadmap (your idea: starting, 1-month, uniqueness)
-            steps, month1, tips = get_roadmap(conn, field)
-            st.subheader(f"Roadmap for {field}")
+        # Roadmap suggestion
+        st.markdown("---")
+        st.subheader("Personalized Roadmap")
+        if st.button("Get roadmap for my field"):
+            connx = conn
+            steps, month1, tips = get_roadmap(connx, field)
             st.write(f"**Starting Steps:** {steps}")
             st.write(f"**1-Month Plan:** {month1}")
             st.write(f"**Uniqueness Tips:** {tips}")
 
-            conn.close()
+        st.markdown("---")
+        st.subheader("Historic Progress")
+        # show recent 30 days by default
+        c = conn.cursor()
+        c.execute("SELECT entry_date, distraction_free, hours_logged FROM daily_entries WHERE user_id = ? ORDER BY entry_date DESC LIMIT 60", (user_id,))
+        rows = c.fetchall()
+        if rows:
+            df_hist = pd.DataFrame(rows, columns=["date","distraction_free","hours"])
+            df_hist["date"] = pd.to_datetime(df_hist["date"])
+            df_hist = df_hist.sort_values("date")
+            st.line_chart(df_hist.set_index("date")[["hours","distraction_free"]])
+            st.table(df_hist.tail(10).assign(distraction_free=lambda d: d["distraction_free"].map({1:"Yes",0:"No"})))
+        else:
+            st.info("Log some days to visualize progress here.")
 
-    # Progress chart (enhanced with total hours)
-    st.header("Your Progress Chart")
-    conn = init_db()
-    c = conn.cursor()
-    c.execute("SELECT hours_per_day, total_hours, last_updated FROM users WHERE user_id = ?", (user_id,))
-    data = c.fetchall()
-    if data:
-        df_progress = pd.DataFrame(data, columns=['Daily Hours', 'Total Hours', 'Date'])
-        st.line_chart(df_progress.set_index('Date')[['Daily Hours', 'Total Hours']])
-        st.metric("Total Hours Invested", df_progress['Total Hours'].iloc[-1])
+    # Bottom: simulator & what-if
+    st.markdown("---")
+    st.header("What-If Simulator")
+    sim_hours = st.slider("Simulate committing hours/day", min_value=1.0, max_value=12.0, value=3.0)
+    sim_months, sim_years, _ = predict_progress(sim_hours, total_hours=get_user(conn, user_id)["total_hours"] if get_user(conn, user_id) else 0)
+    if sim_months is not None:
+        st.write(f"If you do {sim_hours} hrs/day → approx {sim_months} months (~{sim_years} years) to mastery.")
     else:
-        st.info("Log your first session to see charts!")
+        st.info("Increase daily hours to see a mastery estimate.")
+
+    st.markdown("---")
+    st.write("Built with ❤️ — keep consistent, document your learning, and good luck!")
+
     conn.close()
-
-    # Motivational quote
-    st.sidebar.subheader("Daily Motivation")
-    st.sidebar.write(random.choice(motivational_quotes))
-
-    # Simulation "What If?"
-    st.header("What If Simulator")
-    sim_hours = st.slider("Simulate different daily hours", 1.0, 10.0, 4.0)
-    sim_months, sim_years, _ = predict_progress(sim_hours, field)
-    st.write(f"If you commit {sim_hours} hrs/day: Mastery in {sim_months} months / {sim_years} years!")
 
 if __name__ == "__main__":
     main()
