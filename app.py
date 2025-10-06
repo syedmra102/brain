@@ -1,4 +1,4 @@
-import streamlit as st    
+import streamlit as st     
 import pandas as pd
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -6,7 +6,7 @@ from sklearn.linear_model import LinearRegression
 import sqlite3
 from datetime import datetime, timedelta
 import re
-
+ 
 # Database setup (connect to SQLite)
 def init_db():
     conn = sqlite3.connect('user_data.db')
