@@ -16,18 +16,27 @@ def init_db():
     conn = sqlite3.connect("user_data.db")
     c = conn.cursor()
 
+    # Create users table if not exists
     c.execute('''CREATE TABLE IF NOT EXISTS users (
                  user_id TEXT PRIMARY KEY, name TEXT, field TEXT,
                  hours_per_day REAL, distractions TEXT,
                  streak_days INTEGER, badges TEXT,
                  last_updated TEXT, total_hours REAL)''')
 
+    # Create logs table
     c.execute('''CREATE TABLE IF NOT EXISTS logs (
                  user_id TEXT, log_date TEXT, distraction_free INTEGER,
                  hours REAL, exercise INTEGER, diet INTEGER, early_morning INTEGER)''')
 
+    # Ensure column total_hours exists
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN total_hours REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # already exists
+
     conn.commit()
     return conn
+
 
 # ---------------------------
 # ML Helpers
