@@ -13,24 +13,32 @@ import random  # For motivational quotes
 def init_db():
     conn = sqlite3.connect('user_data.db')
     c = conn.cursor()
+    
+    # Always create table if not exists
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (user_id TEXT PRIMARY KEY, field TEXT, hours_per_day REAL, distractions TEXT, 
                   streak_days INTEGER, badges TEXT, last_updated TEXT, total_hours REAL)''')
+    
     c.execute('''CREATE TABLE IF NOT EXISTS roadmaps 
                  (field TEXT PRIMARY KEY, starting_steps TEXT, month1_plan TEXT, uniqueness_tips TEXT)''')
-    # Pre-populate roadmaps with sample data (based on your idea, e.g., cricket)
-    sample_roadmaps = [
-        ("Cricket", "Join a local club; focus on fitness.", "Practice batting/bowling 3x/week; watch tutorials.", "Develop agility for spin bowling if tall."),
-        ("Programming", "Learn Python basics on Codecademy.", "Build 1 CLI app; contribute to GitHub.", "Specialize in ML for healthcare apps."),
-        ("Music", "Practice scales daily; use free apps like Yousician.", "Compose 1 simple song; join online jam sessions.", "Blend genres like fusion for uniqueness."),
-        ("Data Science", "Take free Kaggle courses.", "Analyze a dataset; build a model.", "Focus on ethical AI for social impact."),
-        ("Business", "Read 'Rich Dad Poor Dad'; start a side hustle.", "Create a business plan; network on LinkedIn.", "Innovate in local markets like e-commerce in Pakistan.")
-    ]
-    for field, steps, month1, tips in sample_roadmaps:
-        c.execute("INSERT OR REPLACE INTO roadmaps (field, starting_steps, month1_plan, uniqueness_tips) VALUES (?, ?, ?, ?)",
-                  (field, steps, month1, tips))
+    
+    # Pre-populate roadmaps if empty
+    c.execute("SELECT COUNT(*) FROM roadmaps")
+    if c.fetchone()[0] == 0:
+        sample_roadmaps = [
+            ("Cricket", "Join a local club; focus on fitness.", "Practice batting/bowling 3x/week; watch tutorials.", "Develop agility for spin bowling if tall."),
+            ("Programming", "Learn Python basics on Codecademy.", "Build 1 CLI app; contribute to GitHub.", "Specialize in ML for healthcare apps."),
+            ("Music", "Practice scales daily; use free apps like Yousician.", "Compose 1 simple song; join online jam sessions.", "Blend genres like fusion for uniqueness."),
+            ("Data Science", "Take free Kaggle courses.", "Analyze a dataset; build a model.", "Focus on ethical AI for social impact."),
+            ("Business", "Read 'Rich Dad Poor Dad'; start a side hustle.", "Create a business plan; network on LinkedIn.", "Innovate in local markets like e-commerce in Pakistan.")
+        ]
+        for field, steps, month1, tips in sample_roadmaps:
+            c.execute("INSERT OR REPLACE INTO roadmaps (field, starting_steps, month1_plan, uniqueness_tips) VALUES (?, ?, ?, ?)",
+                      (field, steps, month1, tips))
+
     conn.commit()
     return conn
+
 
 # Load synthetic data for ML recommendations
 @st.cache_data
@@ -156,18 +164,18 @@ def main():
 
             # Update database
             c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO users (user_id, field, hours_per_day, distractions, streak_days, total_hours, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (user_id, field, hours_per_day, distractions, streak_days, updated_total_hours, datetime.now().strftime('%Y-%m-%d')))
-            conn.commit()
+            c.execute("SELECT hours_per_day, total_hours, last_updated FROM users WHERE user_id = ?", (user_id,))
+            data = c.fetchall()
 
-            # Badges
-            badges = update_badges(conn, user_id, hours_per_day, distractions, streak_days, updated_total_hours)
-            if badges:
-                st.balloons()
-                st.success(f"🎉 **Earned Badges:** {', '.join(badges)}")
-            else:
-                st.info("Keep consistent to unlock badges!")
+             if data:
+                     df_progress = pd.DataFrame(data, columns=['Daily Hours', 'Total Hours', 'Date'])
+                     st.line_chart(df_progress.set_index('Date')[['Daily Hours', 'Total Hours']])
+                     st.metric("Total Hours Invested", df_progress['Total Hours'].iloc[-1])
+              else:
+                    st.info("No progress yet! Log your first session to see charts.")
 
+
+            
             # Roadmap (your idea: starting, 1-month, uniqueness)
             steps, month1, tips = get_roadmap(conn, field)
             st.subheader(f"Roadmap for {field}")
