@@ -1,0 +1,6 @@
+field,Sports,Programming,Music,Art,Science
+Cricket,1,0,0,0,0
+Programming,0,1,0,0,1
+Music,0,0,1,1,0
+Art,0,0,1,1,0
+Data Science,0,1,0,0,1
